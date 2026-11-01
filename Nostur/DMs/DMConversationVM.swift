@@ -219,14 +219,28 @@ class ConversionVM: ObservableObject {
     
     private var didLoad = false
     
-    private var onScreenIds: Set<String> = []
+    // Internal (read-only from outside) so tests can verify which messages are considered on screen.
+    private(set) var onScreenIds: Set<String> = []
+    
+    // Only drop back to a spinner when there is nothing on screen to keep showing.
+    // A reload of a conversation that is already rendered must swap content in place (no flash).
+    private var shouldShowLoadingState: Bool {
+        switch viewState {
+        case .initializing, .timeout, .error:
+            return true
+        case .loading, .ready:
+            return false
+        }
+    }
     
     @MainActor
     public func load(force: Bool = false) async {
         guard force || !didLoad else { return }
         self.subscriptions.removeAll()
         self.didLoad = true
-        self.viewState = .loading
+        if shouldShowLoadingState {
+            self.viewState = .loading
+        }
         self.receiverContacts = receivers.map { NRContact.instance(of: $0) }
         self.dmState = getGroupState()
         self.isAccepted = self.dmState?.accepted ?? false
@@ -302,7 +316,7 @@ class ConversionVM: ObservableObject {
     private func refreshFromLocalMessages() async {
         guard let dmState else { return }
         let visibleMessages = await localMessages(for: dmState)
-        applyVisibleMessages(visibleMessages, preservingRenderedMessages: true)
+        applyVisibleMessages(visibleMessages)
     }
     
     @MainActor
@@ -473,42 +487,89 @@ class ConversionVM: ObservableObject {
         return visibleMessages
     }
     
+    // Re-applies a freshly fetched set of messages on top of what is currently rendered.
+    // Rendered NRChatMessage instances are always reused by id (so runtime state survives a
+    // refresh: reactions, reply/quote resolution, dmSendResult on unsent outgoing messages),
+    // and ConversationYear/ConversationDay instances are reused by id as well, so SwiftUI keeps
+    // the existing view identities instead of tearing down and remounting every balloon.
     @MainActor
-    private func applyVisibleMessages(_ visibleMessages: [NRChatMessage], preservingRenderedMessages: Bool = false) {
-        let messages = preservingRenderedMessages ? mergedWithRenderedMessages(visibleMessages) : visibleMessages
+    func applyVisibleMessages(_ visibleMessages: [NRChatMessage]) {
+        // Unconditional merge: reload is stale-while-revalidate, never authoritative for store
+        // deletions. Rendered messages that are absent from this local fetch are re-appended here;
+        // removal only happens via sweepExpiredMessages (or by explicitly replacing the array).
+        let messages = mergedWithRenderedMessages(visibleMessages)
         self.onScreenIds = Set(messages.map { $0.id })
-        
+
+        let renderedYears: [ConversationYear]? = if case .ready(let years) = viewState { years } else { nil }
+        let renderedDaysById = (renderedYears ?? []).reduce(into: [String: ConversationDay]()) { result, year in
+            for day in year.days {
+                result[day.dayId] = day
+            }
+        }
+        let renderedYearsById = (renderedYears ?? []).reduce(into: [String: ConversationYear]()) { result, year in
+            result[year.year] = year
+        }
+
         let calendar = Calendar.current
-        
+
         var messagesByDay: [Date: [NRChatMessage]] {
             return Dictionary(grouping: messages) { nrChatMessage in
                 calendar.startOfDay(for: nrChatMessage.createdAt)
             }
         }
-        
-        let days = messagesByDay.map { (date, messages) in
-            ConversationDay(
-                dayId: dayIdFormatter.string(from: date),
-                date: date,
-                messages: messages
-            )
+
+        let days: [ConversationDay] = messagesByDay.map { (date, dayMessages) in
+            let dayId = dayIdFormatter.string(from: date)
+            guard let existingDay = renderedDaysById[dayId] else {
+                return ConversationDay(
+                    dayId: dayId,
+                    date: date,
+                    messages: dayMessages
+                )
+            }
+            if existingDay.messages.map({ $0.id }) != dayMessages.map({ $0.id }) {
+                existingDay.messages = dayMessages
+            }
+            return existingDay
         }.sorted(by: { $0.dayId > $1.dayId })
-        
+
         var daysByYear: [String: [ConversationDay]] {
             return Dictionary(grouping: days) { day in
                 yearIdFormatter.string(from: day.date)
             }
         }
-        
-        let years = daysByYear.map { (year, days) in
-            ConversationYear(
-                year: year,
-                days: days
-            )
+
+        let years: [ConversationYear] = daysByYear.map { (year, yearDays) in
+            guard let existingYear = renderedYearsById[year] else {
+                return ConversationYear(
+                    year: year,
+                    days: yearDays
+                )
+            }
+            if existingYear.days.map({ $0.dayId }) != yearDays.map({ $0.dayId }) {
+                existingYear.days = yearDays
+            }
+            return existingYear
         }.sorted(by: { $0.year > $1.year })
-        
+
+        let newShape = RenderedConversationShape(days: days)
+        if let renderedYears, newShape == RenderedConversationShape(flatDays: renderedYears) {
+            // Intentionally compared AFTER the in-place updates above: `days`/`years` reuse the
+            // rendered instances, so if a day's membership changed in place both sides already
+            // reflect it and this branch fires too (that day's own @Published update drives
+            // DayView). What it actually guards is that no year/day was added or removed, so
+            // reassigning viewState would only send objectWillChange churn and rebuild nothing.
+            if lastMessageId != messages.last?.id {
+                lastMessageId = messages.last?.id
+            }
+            checkForDisappearingMessagesRequest(messages)
+            return
+        }
+
         viewState = .ready(years)
-        lastMessageId = messages.last?.id
+        if lastMessageId != messages.last?.id {
+            lastMessageId = messages.last?.id
+        }
 
         checkForDisappearingMessagesRequest(messages)
     }
@@ -652,64 +713,55 @@ class ConversionVM: ObservableObject {
         }
 
         let yearId = yearIdFormatter.string(from: messageDate)
-        
-        if case .ready(let years) = self.viewState {
-            // Does the year exist?
-            if let year = years.first(where: { $0.year == yearId }) {
-                // Does the day exist?
-                if let day = year.days.first(where: { $0.dayId == dayIdFormatter.string(from: messageDate) }) {
-                    // Add message to existing day
-                    Task { @MainActor in
-                        withAnimation {
-                            lastMessageId = rumorNEvent.id
-                            self.objectWillChange.send() // without this view doesn't update properly
-                            day.messages = (day.messages + [newChatMessage]).sorted(by: { $0.createdAt < $1.createdAt })
+        let dayId = dayIdFormatter.string(from: messageDate)
+
+        // The mutation has to be deferred, but a burst of imported messages (first messages after
+        // midnight, a backfill batch) can schedule several of these tasks before any of them runs.
+        // Resolve the target year/day again inside the task, so an interleaved task's freshly added
+        // day/year is reused instead of inserting a second instance with the same id (duplicate
+        // SwiftUI identity for ForEach).
+        Task { @MainActor in
+            withAnimation {
+                if case .ready(let years) = self.viewState {
+                    lastMessageId = rumorNEvent.id
+                    self.objectWillChange.send() // without this view doesn't update properly
+
+                    if let year = years.first(where: { $0.year == yearId }) {
+                        if let day = year.days.first(where: { $0.dayId == dayId }) {
+                            // Add message to the existing day (which may have been created by an
+                            // interleaved task) unless it is already there
+                            if !day.messages.contains(where: { $0.id == newChatMessage.id }) {
+                                day.messages = (day.messages + [newChatMessage]).sorted(by: { $0.createdAt < $1.createdAt })
+                            }
                         }
-                    }
-                }
-                else { // Add the day to existing year
-                    Task { @MainActor in
-                        withAnimation {
-                            lastMessageId = rumorNEvent.id
-                            self.objectWillChange.send() // without this view doesn't update properly
-                            year.days = [ConversationDay(
-                                dayId: dayIdFormatter.string(from: messageDate),
+                        else { // Add the day to the existing year, keeping descending dayId order
+                            year.days = ([ConversationDay(
+                                dayId: dayId,
                                 date: messageDate,
                                 messages: [newChatMessage]
-                            )] + year.days
+                            )] + year.days).sorted(by: { $0.dayId > $1.dayId })
                         }
                     }
-                }
-            }
-            else { // add new year, and new day
-                Task { @MainActor in
-                    withAnimation {
-                        lastMessageId = rumorNEvent.id
-                        self.objectWillChange.send() // without this view doesn't update properly
-                        
+                    else { // add new year, and new day
                         self.viewState = .ready(
                             (years + [
                             ConversationYear(
                                 year: yearId,
                                 days: [ConversationDay(
-                                    dayId: dayIdFormatter.string(from: messageDate),
+                                    dayId: dayId,
                                     date: messageDate,
                                     messages: [newChatMessage]
                             )])]).sorted(by: { $0.year > $1.year })
                         )
                     }
                 }
-            }
-        }
-        else { // Add the year and new day
-            Task { @MainActor in
-                withAnimation {
+                else { // Add the year and new day
                     self.objectWillChange.send() // without this view doesn't update properly
                     self.viewState = .ready([
                         ConversationYear(
                             year: yearId,
                             days: [ConversationDay(
-                                dayId: dayIdFormatter.string(from: messageDate),
+                                dayId: dayId,
                                 date: messageDate,
                                 messages: [newChatMessage]
                             )]
@@ -1284,6 +1336,26 @@ enum ConversionVMViewState {
     case error(String)
 }
 
+// Order-sensitive snapshot of what a conversation currently renders: the days in order,
+// each with its message ids in order. Used to detect a structural no-op on re-apply without
+// relying on Equatable (ConversationDay/ConversationYear/NRChatMessage only compare ids).
+private struct RenderedConversationShape: Equatable {
+    struct Day: Equatable {
+        let dayId: String
+        let messageIds: [String]
+    }
+    
+    let days: [Day]
+    
+    init(days: [ConversationDay]) {
+        self.days = days.map { Day(dayId: $0.dayId, messageIds: $0.messages.map { $0.id }) }
+    }
+    
+    init(flatDays years: [ConversationYear]) {
+        self.days = years.flatMap { $0.days }.map { Day(dayId: $0.dayId, messageIds: $0.messages.map { $0.id }) }
+    }
+}
+
 class ConversationYear: Identifiable, Equatable, ObservableObject {
     
     static func == (lhs: ConversationYear, rhs: ConversationYear) -> Bool {
@@ -1307,13 +1379,14 @@ class ConversationDay: Identifiable, Equatable, ObservableObject {
         lhs.id == rhs.id
     }
     
-    var id: UUID
+    // Stable across rebuilds: one unique id per grouped calendar day (e.g. "2025-12-10").
+    // A fresh UUID here made ForEach treat every day as new and remount all balloons on each reload.
+    var id: String { dayId }
     let dayId: String // 2025-12-10
     let date: Date
     @Published var messages: [NRChatMessage]
     
     init(dayId: String, date: Date, messages: [NRChatMessage]) {
-        self.id = UUID()
         self.dayId = dayId
         self.date = date
         self.messages = messages
